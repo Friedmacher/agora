@@ -1,0 +1,9 @@
+# OS Files
+.DS_Store
+
+# AI files
+.claude
+.cline
+
+# Devcontainer files
+.env
