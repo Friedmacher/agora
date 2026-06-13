@@ -1,6 +1,6 @@
 # Agora — Architecture
 
-> **Version:** 1.0 | **Status:** AUTHORITATIVE
+> **Version:** 2.0 | **Status:** AUTHORITATIVE
 
 ---
 
@@ -9,228 +9,243 @@
 ### Component Diagram
 
 ```
-Browser (React SPA)
-        │ HTTPS (443)
+Browser (SAP Fiori Elements app — admin or public)
+        │ HTTPS
         ▼
-┌─────────────────────┐
-│      Nginx          │  Serves static SPA build on /
-│  (reverse proxy)    │  Proxies /api/* to Express API
-└────────┬────────────┘
-         │ HTTP (3000, internal)
-         ▼
-┌─────────────────────┐
-│    Express API      │──── PostgreSQL (5432, internal)
-│  (Node/TypeScript)  │──── MinIO       (9000, internal)
-│                     │──── Nominatim   (HTTPS, external, rate-limited)
-│                     │──── Meta Graph  (HTTPS, external)
-└─────────────────────┘
-
-PostgreSQL and MinIO are not publicly exposed (Docker internal network only).
+┌──────────────────────────────────────────────────┐
+│             SAP BTP ABAP Environment              │
+│                                                  │
+│  ┌───────────────────────────────────────────┐   │
+│  │           OData V4 Service Bindings       │   │
+│  │  ZAGORA_ADMIN_SRV  │  ZAGORA_PUBLIC_SRV   │   │
+│  └─────────────────┬─────────────────────────┘   │
+│                    │                             │
+│  ┌─────────────────▼─────────────────────────┐   │
+│  │           RAP Business Objects            │   │
+│  │  ZAGORA_BP_LOCATION (root + visits)       │   │
+│  │  ZAGORA_BP_ADMIN_USER                     │   │
+│  └─────────────────┬─────────────────────────┘   │
+│                    │                             │
+│  ┌─────────────────▼─────────────────────────┐   │
+│  │              SAP HANA (managed)           │   │
+│  │  ZAGORA_LOCATION · ZAGORA_VISIT           │   │
+│  │  ZAGORA_ADMIN_USER                        │   │
+│  └───────────────────────────────────────────┘   │
+│                                                  │
+│  BTP Identity Authentication Service (IAS)       │
+│  ←──── All admin authentication and sessions     │
+└──────────────────────────────────────────────────┘
 ```
 
 ### Service Boundaries
 
-- The Express API is the **sole** service that communicates with PostgreSQL and MinIO. The React SPA never holds DB credentials or storage credentials.
-- Social tokens exist only in PostgreSQL (encrypted at rest) and briefly in Express process memory during a share operation.
-- The React SPA is a static build artifact served by Nginx. It has no runtime process.
+- The RAP framework is the **sole** layer that reads and writes SAP HANA. There is no separate API process or middleware tier.
+- SAP Fiori Elements apps are metadata-driven and generated from CDS annotations. No custom SAPUI5 controller code is required for standard List Report / Object Page flows.
+- SAP BTP IAS manages all authentication and session tokens. No application code handles passwords, tokens, or session state.
+- There is no file storage layer. Image handling is out of scope for v2.
 
 ---
 
 ## 2. Request Data Flows
 
 **1. Admin creates a location**
-`POST /api/locations` → Express validates JWT → writes location to DB (status=wishlist or visited) → returns 201 with location → background: queues Nominatim geocoding request → on geocoding success, `PATCH locations SET lat/lng` → WebSocket or polling update to UI (or admin triggers manually).
 
-**2. Image upload**
-`POST /api/locations/:id/images` (multipart) → Express validates JWT + file constraints → streams to MinIO at `{location_id}/{uuid}.{ext}` → inserts `images` record with `storage_key` → generates presigned URL (1h TTL) → returns `{id, presigned_url, display_order}`.
+Fiori Elements List Report (Create button) → OData POST to `ZAGORA_ADMIN_SRV/.../Location` → RAP framework validates ETag prerequisites → routes to `MODIFY` method of `ZAGORA_BP_LOCATION` → behavior implementation validates required fields, checks authorization object `ZAGORA_LOC` activity `02` (Create) → inserts row into `ZAGORA_LOCATION` → OData response `201 Created` with the new entity including RAP-managed `LocationUuid`, `CreatedAt`, `LastChangedAt` (ETag value).
 
-**3. Public map load**
-`GET /api/dashboard/map` (unauthenticated) → DB query `SELECT id, name, type, status, lat, lng, overall_score, first image storage_key FROM locations WHERE lat IS NOT NULL` → for each location with an image, generate MinIO presigned URL (24h TTL) → return JSON array → React renders Leaflet map with 8 pin icon variants.
+**2. Admin updates ratings (overall_score recomputation)**
 
-**4. Social share**
-`POST /api/social/share` → Express validates JWT → fetches encrypted token from DB → decrypts in memory with `SOCIAL_TOKEN_ENCRYPTION_KEY` → if IG and token within 10 days of expiry: refresh token first, re-encrypt, store → generate MinIO presigned URL for selected image (10m TTL minimum) → call Meta Graph API → return `{post_id, url}` → plaintext token discarded from memory.
+Fiori Elements Object Page (Save after editing ratings) → OData PATCH on `Location` entity → `If-Match` ETag header required → RAP `MODIFY` method detects that `PriceRating`, `AmbienceRating`, or `QualityRating` is in the changed field set → behavior implementation checks each rating for the initial value (unset) → if all three are set: `OverallScore = (price + ambience + quality) / 3`; if any is unset: `OverallScore = null` → both the changed ratings and the new `OverallScore` are persisted in the same RAP SAVE sequence. No separate or asynchronous step.
+
+**3. Public browses The Codex**
+
+Browser loads the public Fiori Elements List Report app → app calls `GET .../Location` on `ZAGORA_PUBLIC_SRV` (anonymous binding, no authentication required) → RAP framework evaluates CDS access control (DCL object grants unrestricted read on the public service) → returns `Location` collection → user navigates to a detail page → `GET .../Location(guid)?$expand=_Visit` → `Visit` entities returned from `ZAGORA_C_VISIT_PUB` projection, which structurally excludes `AdminUserId`.
+
+**4. Wishlist promotion**
+
+Admin triggers the "Promote to Codex" action button on the Location Object Page → Fiori Elements sends OData POST to `.../Location(guid)/com.sap.zagora.promote` → RAP framework routes to the bound action method in `ZAGORA_BP_LOCATION` → action validates `Status = 'WISHLIST'` (raises exception if already `VISITED`) → sets `Status = 'VISITED'` and updates `LastChangedAt` → returns the updated `Location` entity → Fiori Elements refreshes the Object Page.
+
+**5. Admin views The Archive**
+
+Admin navigates to The Archive Fiori app → app calls `GET .../GetDashboardStats()` on `ZAGORA_ADMIN_SRV` → RAP function implementation executes five HANA aggregation queries (COUNT for totals, MAX visit count per location, MAX `OverallScore` excluding nulls) → returns a single structured result → Fiori Elements renders the analytics strip and two sorted location lists.
 
 ---
 
 ## 3. Security
 
-### 3.1 JWT Strategy
+### 3.1 Authentication — BTP Identity Authentication Service (IAS)
 
-- **Access token:** 15-minute expiry, HS256, payload `{sub: user_id, email, role: "admin"}`.
-- **Refresh token:** 7-day expiry, HS256. On issuance: raw token is returned to client and its SHA-256 hash is stored in `refresh_tokens` with an expiry. On use: old token row is marked `revoked_at = now()` and a new pair is issued (rotation). Compromised tokens can be revoked server-side.
-- All protected routes validate the access token via `authMiddleware` before the route handler executes.
+All admin users authenticate via SAP BTP IAS using SAML 2.0 or OIDC federation between IAS and the BTP ABAP system. The Fiori Elements app is registered as an application in IAS. Token lifetimes, session management, and refresh are governed by IAS configuration — no application code handles these concerns. Public read access requires no authentication.
 
-### 3.2 Password Handling
+### 3.2 Authorization — ABAP Authorization Objects and BTP Role Collections
 
-- bcrypt with cost factor ≥ 12.
-- No password reset UI in v1. Recovery: a CLI seed script (`npm run seed:reset-password`) available on the server for emergency access restoration.
+One custom ABAP authorization object is defined:
 
-### 3.3 Social Token Encryption
+| Object | Field | Allowed Activities |
+|---|---|---|
+| `ZAGORA_LOC` | `ACTVT` | `01` Read, `02` Create, `03` Change/Update, `06` Delete |
 
-- Algorithm: **AES-256-GCM**.
-- Key source: `SOCIAL_TOKEN_ENCRYPTION_KEY` env var (32-byte hex). Never stored in DB or source control.
-- Storage format in DB (single text column): `{iv_hex}:{auth_tag_hex}:{ciphertext_hex}`.
-- Decryption occurs in Express memory only at the moment of a share or token refresh call. Plaintext never leaves the process.
+A PFCG role `ZAGORA_ADMIN_ROLE` grants `ZAGORA_LOC` with the full activity set (`01`, `02`, `03`, `06`). This role is mapped to the BTP role collection `Agora_Admin`. Admin users are assigned `Agora_Admin` in the BTP cockpit.
 
-### 3.4 Transport and Headers
+Authorization checks are performed in the RAP behavior implementation methods before any MODIFY or DELETE operation executes.
 
-- Nginx terminates TLS (HTTPS on port 443). HTTP redirects to HTTPS.
-- Express uses `helmet` middleware for standard security headers (CSP, HSTS, X-Frame-Options).
-- CORS: Express configured to accept requests only from `CORS_ORIGIN` (nginx public URL in production; `http://localhost:5173` in development).
+Public read access: The public service binding `ZAGORA_PUBLIC_SRV` uses a CDS access control (DCL object) that grants unrestricted read without any authorization object check. Write operations are structurally absent from the public service definition.
+
+### 3.3 Transport Management
+
+All development objects (HANA tables, ABAP dictionary types and domains, CDS views, behavior definitions, service definitions, service bindings, PFCG roles) belong to transportable ABAP package `ZAGORA`. Changes must pass the ABAP Test Cockpit (ATC) with no errors and no priority-1 warnings before the transport request is released for import to quality/production. Standard CTS (Change and Transport System) is used, integrated with the BTP ABAP environment's three-system transport chain (Dev → QA → Production).
+
+### 3.4 ETag and Optimistic Locking
+
+All root and child BO entities expose `LastChangedAt` as the `etag master` field (declared via the `@Semantics.systemDateTime.lastChangedAt` annotation and `etag master LastChangedAt` in the behavior definition). Clients must supply the current ETag value in the `If-Match` header on all PATCH, PUT, DELETE, and bound-action requests. The RAP framework enforces this automatically and returns HTTP `412 Precondition Failed` on an ETag mismatch — no application code is required for this check.
 
 ---
 
 ## 4. Implementation Notes
 
-### 4.1 Nominatim Rate Limiting
-
-The public `nominatim.openstreetmap.org` instance enforces a **1 request/second** hard limit per [usage policy](https://operations.osmfoundation.org/policies/nominatim/). Violations result in IP bans.
-
-- Maintain an in-process async FIFO queue in `api/src/services/geocoding.ts`.
-- Enforce a **1,100 ms minimum delay** between outgoing requests (10% buffer).
-- Geocoding is triggered **after** a successful location save, not before. The save returns `201` immediately; lat/lng start as null.
-- Each request must include a `User-Agent` header: `Agora/1.0 (self-hosted; contact: <admin-email>)`.
-- If geocoding fails or times out (10 s timeout), lat/lng remain null. The location detail page and edit form show a visual indicator and a "Re-geocode" button that re-queues the request.
-- The map endpoint (`GET /dashboard/map`) silently excludes locations with null coordinates.
-
-### 4.2 Instagram Graph API Constraints
-
-- Requires an **Instagram Business or Creator account** linked to a **Facebook Page**. Personal Instagram accounts cannot use the publishing API.
-- Token flow: authorization code → short-lived user token (1h) → exchange for long-lived token (60 days) → store encrypted.
-- **Token refresh strategy:** On each share call, check `expires_at`. If within 10 days, call the token refresh endpoint first, re-encrypt the new token, update the DB, then proceed with the share.
-- The image sent to the Instagram API must be **publicly accessible via URL** at the time of the API call. Use MinIO presigned URLs with a **minimum 10-minute TTL** to ensure the URL is valid during Meta's asynchronous media processing.
-- v1 supports **single-image posts** only. Carousel posts are out of scope.
-- Surface a clear error in the admin UI if: (a) no Instagram account is connected, (b) the token is expired, or (c) the location has no images.
-
-### 4.3 Overall Score Computation
+### 4.1 Overall Score Computation
 
 `overall_score = (price_rating + ambience_rating + quality_rating) / 3.0`
 
-- Computed in **application code** (not a PostgreSQL `GENERATED ALWAYS AS` column) because all three inputs are nullable and a generated column would require verbose `CASE` expressions to handle nullability correctly.
-- Returns `null` if any dimension is `null` — including for wish-list entries (which typically have no ratings).
-- Recalculated and stored on every `PATCH /locations/:id` that includes any of the three rating fields.
-- The Archive "highest ranked" stat excludes locations where `overall_score IS NULL`.
+- Computed in the `MODIFY` method of behavior implementation class `ZAGORA_BP_LOCATION`, triggered when `PriceRating`, `AmbienceRating`, or `QualityRating` is in the changed field set.
+- **ABAP initial-value handling:** In ABAP, the initial value for `abap.int1` is `0`, which is indistinguishable from a zero rating without an explicit "is set" flag. The HANA column for each rating field must allow NULL. The behavior implementation sets the field to null when the user clears a rating, and tests for null/initial before computing the score. If any rating is null/initial, `OverallScore` is explicitly set to null (`abap.dec(3,2)` with NULL in HANA).
+- Extract the computation into a private helper method in the behavior implementation class and cover it with ABAP Unit tests.
+- The Archive stat `HighestRanked` excludes locations where `OverallScore IS NULL`.
 
-### 4.4 MinIO Presigned URL Strategy
+### 4.2 AdminUserId Attribution
 
-- `images.storage_key` stores the MinIO object path (e.g. `3f8a1c.../a9d2b4....jpg`). This is the only image identifier persisted in the DB.
-- Presigned URLs are generated by the API layer **on every response** that includes image data. They are never stored.
-- TTL policy:
-  - Gallery view (Codex detail page): **1-hour TTL**
-  - Map thumbnail (Atlas): **24-hour TTL** (reduces overhead on map load)
-  - Social share image: **10-minute minimum TTL**
-- When deleting a location or image: delete the MinIO object first, then the DB record. Failure to delete from MinIO is logged but does not block the DB deletion (orphan cleanup can be a maintenance task).
+On Visit Create, the behavior implementation sets `AdminUserId` using:
+```abap
+cl_abap_context_info=>get_user_technical_name( )
+```
+or the equivalent call for resolving the BTP IAS principal in the ABAP system context. This field is set server-side and must **not** be included in the Create request body — if supplied, it is ignored.
 
-### 4.5 Visit Attribution in Public vs. Admin Contexts
+`AdminUserId` is defined on the interface CDS view `ZAGORA_I_VISIT`. It is structurally absent from the public consumption view `ZAGORA_C_VISIT_PUB`. The admin consumption view `ZAGORA_C_VISIT` may expose it, optionally joined with `DisplayName` from `ZAGORA_ADMIN_USER` for attribution display.
 
-- `visits.admin_user_id` records which admin logged each visit.
-- **Public API responses** (`GET /locations/:id/visits`) omit `admin_user_id` — only `id`, `visited_at`, `note`, `created_at` are returned.
-- **Admin API responses** may include `admin_user_id` and `display_name` (joined from `admin_users`) to show attribution in the admin UI.
+### 4.3 CDS Naming Conventions
+
+All custom development objects use the `ZAGORA_` namespace prefix. Sub-packages: `ZAGORA_DATA` (HANA tables, dictionary types, domains), `ZAGORA_SERVICES` (CDS views, behavior definitions, service objects).
+
+| Object Type | Pattern | Example |
+|---|---|---|
+| HANA table (transparent) | `ZAGORA_<ENTITY>` | `ZAGORA_LOCATION` |
+| Basic interface CDS view | `ZAGORA_I_<ENTITY>` | `ZAGORA_I_LOCATION` |
+| Consumption CDS view (admin) | `ZAGORA_C_<ENTITY>` | `ZAGORA_C_LOCATION` |
+| Consumption CDS view (public) | `ZAGORA_C_<ENTITY>_PUB` | `ZAGORA_C_LOCATION_PUB` |
+| Behavior definition | `ZAGORA_I_<ENTITY>` | (same name as interface CDS view) |
+| Behavior implementation class | `ZAGORA_BP_<ENTITY>` | `ZAGORA_BP_LOCATION` |
+| Service definition (admin) | `ZAGORA_<ENTITY>_SD` | `ZAGORA_LOCATION_SD` |
+| Service definition (public) | `ZAGORA_<ENTITY>_PUBLIC_SD` | `ZAGORA_LOCATION_PUBLIC_SD` |
+| Service binding (admin) | `ZAGORA_ADMIN_SRV` | |
+| Service binding (public) | `ZAGORA_PUBLIC_SRV` | |
+| Authorization object | `ZAGORA_LOC` | |
+| PFCG role | `ZAGORA_ADMIN_ROLE` | |
+| ABAP domain | `ZAGORA_D_<NAME>` | `ZAGORA_D_LOC_TYPE` |
+| RAP draft table (auto-generated) | `ZAGORA_<ENTITY>_D` | `ZAGORA_LOC_D`, `ZAGORA_VIS_D` |
+
+### 4.4 Fiori Elements Floorplan Assignments
+
+All UI behavior is driven by CDS annotations (`@UI.lineItem`, `@UI.fieldGroup`, `@UI.facet`, `@UI.selectionField`, `@UI.identification`, etc.) on the consumption CDS views. No custom SAPUI5 controller code is required for standard floorplans.
+
+| Module | Fiori Elements Floorplan | Notes |
+|---|---|---|
+| The Codex — location list | List Report Object Page (LROP) | Filter bar: `Status`, `LocType`; table: `Name`, `City`, `LocType`, `Status`, `OverallScore` |
+| The Codex — location detail | Object Page (within LROP) | Sections: Basic Info, Ratings, Visit Timeline (table facet for `_Visit`) |
+| The Forum | Same LROP pre-filtered `Status = 'WISHLIST'`, or separate Fiori app with a fixed filter | Object Page header: "Promote to Codex" bound action button |
+| The Archive | Overview Page (OVP) or Analytical List Page (ALP) | KPI card or header area for the analytics strip (R-031); table sections for the two sorted lists (R-032) |
+| Admin User Management | Simple List Report | Create and Delete actions inline; no navigation to Object Page required |
+| Public Codex | Read-only List Report | Served from `ZAGORA_PUBLIC_SRV`; no Create/Edit/Delete buttons; separate Fiori app deployment |
+
+### 4.5 Draft Handling
+
+RAP managed draft is enabled for the `Location` BO (root + compositions). This supports the standard Fiori Object Page UX where a user can start editing, navigate away, and resume their unsaved changes.
+
+- Declared with `with draft` on the root entity in the behavior definition.
+- Draft HANA tables (`ZAGORA_LOC_D`, `ZAGORA_VIS_D`) are auto-generated by the RAP framework — do not create these manually.
+- Draft is available only on the admin service binding (`ZAGORA_ADMIN_SRV`). The public service binding does not expose draft operations.
+- The `AdminUser` BO does not use draft (simple roster management does not benefit from it).
 
 ---
 
-## 5. Infrastructure (Docker Compose)
+## 5. Infrastructure and Deployment
 
-### Service Topology
+### Deployment Model
 
-| Service | Base Image | Exposed Port | Internal Port | Volumes | Depends On |
-|---|---|---|---|---|---|
-| `nginx` | `nginx:alpine` | 80, 443 | — | `./web/dist:/usr/share/nginx/html:ro`, SSL certs | `api` |
-| `api` | Custom Dockerfile | — | 3000 | — | `db`, `minio` |
-| `db` | `postgres:16-alpine` | — | 5432 | `postgres_data:/var/lib/postgresql/data` | — |
-| `minio` | `minio/minio:latest` | 9001 (console, optional) | 9000 | `minio_data:/data` | — |
+SAP BTP ABAP Environment is a fully managed PaaS. There is no infrastructure to provision, no containers to build, and no environment variables in the Docker Compose sense. Deployment is performed via:
 
-The React SPA is **not** a runtime service. It is built via `npm run build` and the `dist/` output is bind-mounted into the `nginx` container. The `api` container hosts only the Node/Express backend.
+- **ABAP Development Tools (ADT)** in Eclipse — primary development and transport workflow.
+- **abapGit** — links the ABAP package `ZAGORA` to a Git repository. Each ABAP object is serialized as XML on push and deserialized on pull.
 
-### Environment Variables
+### Transport Chain
 
-**`api` service**
+Standard ABAP three-system landscape:
 
-| Variable | Description |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | HS256 signing key for access tokens |
-| `JWT_REFRESH_SECRET` | HS256 signing key for refresh tokens |
-| `MINIO_ENDPOINT` | MinIO host (e.g. `minio:9000`) |
-| `MINIO_ACCESS_KEY` | MinIO access key |
-| `MINIO_SECRET_KEY` | MinIO secret key |
-| `MINIO_BUCKET` | Bucket name (e.g. `agora-images`) |
-| `MINIO_USE_SSL` | `false` for internal Docker network |
-| `SOCIAL_TOKEN_ENCRYPTION_KEY` | 32-byte hex string (AES-256 key) |
-| `NOMINATIM_BASE_URL` | Default: `https://nominatim.openstreetmap.org` |
-| `META_APP_ID` | Meta (Facebook/Instagram) App ID |
-| `META_APP_SECRET` | Meta App Secret |
-| `META_OAUTH_REDIRECT_URI` | Publicly reachable callback URL |
-| `CORS_ORIGIN` | Allowed origin (nginx public URL) |
-| `NODE_ENV` | `production` or `development` |
+```
+Development system → Quality / Test system → Production system
+```
 
-**`db` service**
+Transport requests are created and released in ADT (Transport Organizer). Import into quality/production is triggered via the BTP cockpit or the CTS import queue.
 
-| Variable | Description |
-|---|---|
-| `POSTGRES_USER` | DB superuser |
-| `POSTGRES_PASSWORD` | DB password |
-| `POSTGRES_DB` | Database name |
+### Configuration
 
-**`minio` service**
+There are no environment variables. Runtime configuration is managed via:
 
-| Variable | Description |
-|---|---|
-| `MINIO_ROOT_USER` | MinIO root user |
-| `MINIO_ROOT_PASSWORD` | MinIO root password |
+- **ABAP system parameters** (managed by SAP BTP).
+- **IAS application configuration** (OIDC/SAML trust setup, user groups, attribute mappings) — configured in the IAS admin console.
+- **BTP role collection assignments** — configured in the BTP cockpit; maps `Agora_Admin` role collection to IAS user groups or individual users.
 
 ---
 
 ## 6. Repository Structure
 
-Monorepo. All services in one repository, deployed via a single `docker-compose.yml`.
+The monorepo file layout (api/, web/, nginx/) from v1.0 does not apply. All application logic lives in the BTP ABAP system, managed via abapGit.
 
 ```
-agora/
-├── api/                        Node/Express backend (TypeScript)
-│   ├── src/
-│   │   ├── routes/             One file per resource group
-│   │   │   ├── auth.ts
-│   │   │   ├── locations.ts
-│   │   │   ├── visits.ts
-│   │   │   ├── images.ts
-│   │   │   ├── dashboard.ts
-│   │   │   ├── social.ts
-│   │   │   └── adminUsers.ts
-│   │   ├── middleware/
-│   │   │   ├── authMiddleware.ts
-│   │   │   └── errorHandler.ts
-│   │   ├── services/
-│   │   │   ├── geocoding.ts    Nominatim queue + rate limiter
-│   │   │   ├── minio.ts        MinIO client, presigned URL helpers
-│   │   │   ├── crypto.ts       AES-256-GCM encrypt/decrypt for social tokens
-│   │   │   └── social/
-│   │   │       ├── instagram.ts
-│   │   │       └── facebook.ts
-│   │   ├── db/
-│   │   │   ├── pool.ts         pg Pool singleton
-│   │   │   ├── migrations/     Numbered SQL migration files
-│   │   │   └── seed.ts         Superuser seed script
-│   │   └── index.ts            Express app entry point
-│   ├── Dockerfile
-│   └── package.json
-├── web/                        React SPA (Vite + TypeScript)
-│   ├── src/
-│   │   ├── modules/
-│   │   │   ├── codex/          Location log pages and components
-│   │   │   ├── forum/          Wish-list pages and components
-│   │   │   ├── archive/        Dashboard
-│   │   │   ├── atlas/          Map view (Leaflet)
-│   │   │   └── social/         Share UI + OAuth connection pages
-│   │   ├── shared/
-│   │   │   ├── components/     Reusable UI components
-│   │   │   ├── hooks/          Custom React hooks
-│   │   │   └── lib/            API client, types, utilities
-│   │   └── App.tsx             Router + providers
-│   └── vite.config.ts
-├── nginx/
-│   └── nginx.conf
-├── docker-compose.yml
-├── .env.example
-└── README.md
+<git-repository-root>/
+├── REQUIREMENTS.md
+├── DATA_MODEL.md
+├── API_SPEC.md
+├── ARCHITECTURE.md
+└── src/                         abapGit-serialized ABAP objects
+    ├── ZAGORA_DATA/             Sub-package: dictionary objects
+    │   ├── ZAGORA_LOCATION.tabl.xml
+    │   ├── ZAGORA_VISIT.tabl.xml
+    │   ├── ZAGORA_ADMIN_USER.tabl.xml
+    │   ├── ZAGORA_D_LOC_TYPE.doma.xml
+    │   └── ZAGORA_D_STATUS.doma.xml
+    └── ZAGORA_SERVICES/         Sub-package: CDS views, behavior, service objects
+        ├── ZAGORA_I_LOCATION.ddls.xml
+        ├── ZAGORA_I_VISIT.ddls.xml
+        ├── ZAGORA_C_LOCATION.ddls.xml
+        ├── ZAGORA_C_LOCATION_PUB.ddls.xml
+        ├── ZAGORA_C_VISIT.ddls.xml
+        ├── ZAGORA_C_VISIT_PUB.ddls.xml
+        ├── ZAGORA_C_ADMIN_USER.ddls.xml
+        ├── ZAGORA_C_DASHBOARD_STATS.ddls.xml
+        ├── ZAGORA_I_LOCATION.bdef.xml    (behavior definition)
+        ├── ZAGORA_BP_LOCATION.clas.xml   (behavior impl class)
+        ├── ZAGORA_BP_ADMIN_USER.clas.xml
+        ├── ZAGORA_LOCATION_SD.srvd.xml   (service definition — admin)
+        ├── ZAGORA_LOCATION_PUBLIC_SD.srvd.xml
+        ├── ZAGORA_ADMIN_SRV.srvb.xml     (service binding — admin)
+        └── ZAGORA_PUBLIC_SRV.srvb.xml
 ```
+
+---
+
+## 7. Terminology Glossary
+
+| v1.0 Term | v2.0 Equivalent |
+|---|---|
+| PostgreSQL table | HANA transparent table (ABAP dictionary table) |
+| UUID PK / `gen_random_uuid()` | `sysuuid_x16`; RAP-managed key generation (`%key` auto-fill) |
+| `PATCH /locations/:id` | OData PATCH on `Location` entity with `If-Match` ETag |
+| JWT access token | BTP IAS session token (managed by IAS, not by application code) |
+| `authMiddleware` (Express) | ABAP authorization object check in RAP behavior implementation |
+| Express route handler | RAP behavior implementation method in `ZAGORA_BP_*` class |
+| Docker service | BTP ABAP Environment managed service instance |
+| `timestamptz` | `abap.utclong` |
+| `smallint CHECK(1–5)` | `abap.int1` with validation rule in behavior definition |
+| PostgreSQL `ENUM` type | ABAP domain with fixed values (`ZAGORA_D_*`) |
+| npm migration script | ABAP dictionary table activation + CTS transport |
+| `.env` file | BTP cockpit / IAS configuration |
+| Nginx reverse proxy | SAP BTP ABAP Environment built-in HTTP routing |

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Agora is a personal hospitality location manager — a **software project** (React SPA + Node/Express API + PostgreSQL + MinIO), not an Obsidian vault task. The vault-level CLAUDE.md (one level up) does not apply here.
+Agora is a personal hospitality location manager — a **software project** (SAP BTP ABAP Environment + SAP Fiori Elements + SAP HANA), not an Obsidian vault task. The vault-level CLAUDE.md (one level up) does not apply here.
 
 ## Authoritative References
 
@@ -12,136 +12,106 @@ Read these before making any substantive changes. Together they are the single s
 
 | File | Contents |
 |---|---|
-| [`REQUIREMENTS.md`](REQUIREMENTS.md) | Project overview, functional requirements (R-001–R-088), non-functional requirements, out-of-scope |
-| [`DATA_MODEL.md`](DATA_MODEL.md) | Entity-relationship diagram, all table schemas |
-| [`API_SPEC.md`](API_SPEC.md) | Full endpoint inventory with auth notation and payloads |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Component diagram, request flows, security, implementation notes, infra/env vars, repo structure |
+| [`REQUIREMENTS.md`](REQUIREMENTS.md) | Project overview, functional requirements (R-001–R-069), non-functional requirements, out-of-scope, R-ID mapping appendix |
+| [`DATA_MODEL.md`](DATA_MODEL.md) | RAP BO hierarchy, HANA table schemas (ABAP types), ABAP domain definitions |
+| [`API_SPEC.md`](API_SPEC.md) | OData V4 service bindings, entity sets, operations, custom actions, query options |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Component diagram, request flows, security, RAP implementation notes, CDS naming conventions, Fiori floorplan map, repo structure, terminology glossary |
 
-## Commands
+## Development Workflow
 
-### Docker (primary workflow)
+### Primary tools
 
-```bash
-# Start all services (builds API image and starts db, minio, nginx)
-docker compose up --build
+- **ABAP Development Tools (ADT)** in Eclipse — create and edit all ABAP objects, run ATC checks, manage transport requests.
+- **abapGit** — sync between the ABAP system and this Git repository (`src/` directory contains abapGit-serialized XML objects).
+- **BTP Cockpit** — manage role collection assignments, IAS trust configuration, service instances.
+- **IAS Admin Console** — provision admin users, manage user groups and attribute mappings.
 
-# Start in detached mode
-docker compose up --build -d
+### ATC (ABAP Test Cockpit)
 
-# View API logs
-docker compose logs -f api
+Run ATC checks before releasing any transport request:
 
-# Run DB migrations
-docker compose exec api npm run migrate
+1. In ADT: right-click the `ZAGORA` package → *Run As* → *ABAP Test Cockpit*.
+2. All checks must pass with no errors and no priority-1 warnings (R-069).
+3. ABAP Unit tests in behavior implementation classes run as part of ATC.
 
-# Seed the superuser
-docker compose exec api npm run seed
+### abapGit sync
 
-# Reset an admin password (emergency recovery)
-docker compose exec api npm run seed:reset-password
+```
+Push (ABAP → Git):  In ADT abapGit view, select the ZAGORA repository → Push
+Pull (Git → ABAP):  In ADT abapGit view, select the ZAGORA repository → Pull
 ```
 
-### API development (without Docker)
+### Transport
 
-```bash
-cd agora/api
-npm install
-npm run dev        # ts-node-dev / nodemon hot reload
-npm run build      # tsc → dist/
-npm run lint
-npm test           # jest
-npm test -- --testPathPattern=auth   # run a single test file
-```
-
-### Web development (without Docker)
-
-```bash
-cd agora/web
-npm install
-npm run dev        # Vite dev server on :5173 (proxies /api to localhost:3000)
-npm run build      # outputs to dist/
-npm run lint
-npm run type-check
-```
+1. All changes go into a transport request (automatically created on first object edit in the `ZAGORA` package).
+2. Release the request in the Transport Organizer after ATC passes.
+3. Import into QA/Production via the BTP cockpit or the CTS import queue.
 
 ## Stack
 
-React (Vite) + Node/Express (TypeScript) + PostgreSQL 16 + MinIO + Nginx — all in Docker Compose.
+SAP BTP ABAP Environment (managed cloud) + SAP HANA (managed) + SAP Fiori Elements (OData V4 / CDS annotations).
 
 **Module names (use these consistently):**
 - **The Codex** — visited location log
 - **The Forum** — wish-list
 - **The Archive** — dashboard (admin landing page)
-- **The Atlas** — map view (Leaflet + OSM)
 
 ## Architecture
 
 ### Request path
 
-All traffic enters Nginx on 443. Static SPA assets served directly; `/api/*` proxied to Express on port 3000 (internal Docker network). PostgreSQL and MinIO are not reachable outside the Docker network.
+Browser → OData V4 service binding (`ZAGORA_ADMIN_SRV` or `ZAGORA_PUBLIC_SRV`) → RAP Business Objects (`ZAGORA_BP_LOCATION`, `ZAGORA_BP_ADMIN_USER`) → SAP HANA. All routing is handled by the BTP ABAP Environment's built-in OData gateway — no Nginx, no custom middleware.
 
-### Auth flow
+### Auth
 
-- Access token: 15-min HS256 JWT, payload `{sub, email, role: "admin"}`, validated by `authMiddleware` on every protected route.
-- Refresh token: 7-day HS256 JWT; raw token returned to client, **SHA-256 hash** stored in `refresh_tokens`. On use: old row is revoked and a new pair issued (rotation).
+- Admin access: BTP IAS (SAML 2.0 / OIDC). No application-layer tokens or password hashing.
+- Role enforcement: ABAP authorization object `ZAGORA_LOC` checked in RAP behavior implementations. Admin role collection: `Agora_Admin` (assigned in BTP cockpit).
+- Public access: anonymous read via `ZAGORA_PUBLIC_SRV`; enforced by CDS access control (DCL).
 
 ### Key cross-cutting concerns
 
 | Concern | Where | Detail |
 |---|---|---|
-| `overall_score` | `api/src/routes/locations.ts` | Application-computed `(price + ambience + quality) / 3`; **not** a DB generated column. Must be recalculated and persisted on every rating PATCH. Returns null if any dimension is null. |
-| Presigned URLs | `api/src/services/minio.ts` | `images.storage_key` is the only image identifier in the DB. Presigned URLs are generated per-response (1h gallery, 24h map, 10m social) and never stored. |
-| Nominatim geocoding | `api/src/services/geocoding.ts` | FIFO in-process queue, **1,100 ms minimum delay** between requests. Geocoding is triggered after `201` is returned; lat/lng start null. `User-Agent` header required. |
-| Social token encryption | `api/src/services/crypto.ts` | AES-256-GCM, key from `SOCIAL_TOKEN_ENCRYPTION_KEY`. DB format: `{iv_hex}:{auth_tag_hex}:{ciphertext_hex}`. Decrypted in memory only at share/refresh time. |
-| Public vs. admin responses | `api/src/routes/visits.ts` | `admin_user_id` is stored but **omitted** from all public API responses. |
-
-### Social sharing constraints
-
-- Instagram requires a Business/Creator account linked to a Facebook Page (no personal accounts).
-- The share image URL must be publicly accessible during Meta's async media processing — use a MinIO presigned URL with **at least 10-minute TTL**.
-- On each share call: if token `expires_at` is within 10 days, refresh the token first, re-encrypt, update the DB, then share.
+| `OverallScore` | `ZAGORA_BP_LOCATION` (MODIFY method) | Application-computed `(price + ambience + quality) / 3`; **not** a HANA generated column. Recalculated and persisted on every MODIFY that changes any rating. Returns null if any rating is unset (initial value). |
+| `AdminUserId` on Visit | `ZAGORA_BP_LOCATION` (Create Visit) | Set server-side via `cl_abap_context_info=>get_user_technical_name()`. Never in request body. **Structurally absent** from `ZAGORA_C_VISIT_PUB`. |
+| ETag locking | All root + child BOs | `LastChangedAt` is the ETag master. `If-Match` required on all modifying requests; HTTP 412 on mismatch — RAP-enforced. |
+| Draft | `Location` BO only | RAP managed draft (`with draft`). Draft tables `ZAGORA_LOC_D` / `ZAGORA_VIS_D` auto-generated. Admin service only. |
 
 ## Domain Entities
 
-`locations`, `visits`, `admin_users`, `images`, `refresh_tokens` — all UUIDs via `gen_random_uuid()`.
+`ZAGORA_LOCATION`, `ZAGORA_VISIT`, `ZAGORA_ADMIN_USER` — all `sysuuid_x16` PKs, RAP-managed.
 
-Key constraints not obvious from column names:
-- `locations.status`: `visited | wishlist` (default `wishlist`)
-- `locations.type`: `restaurant | coffeehouse | bar | bakery`
-- Rating columns (`price_rating`, `ambience_rating`, `quality_rating`): `smallint`, nullable, CHECK 1–5
-- `images.display_order`: lower = shown first
-- `visits.admin_user_id`: FK to `admin_users`, not exposed publicly
+Key constraints not obvious from field names:
+- `Status`: domain `ZAGORA_D_STATUS` — `VISITED | WISHLIST` (default `WISHLIST`)
+- `LocType`: domain `ZAGORA_D_LOC_TYPE` — `RESTAURANT | COFFEEHOUSE | BAR | BAKERY`
+- Rating fields (`PriceRating`, `AmbienceRating`, `QualityRating`): `abap.int1`, nullable, CHECK 1–5 in behavior definition
+- `AdminUserId` on `ZAGORA_VISIT`: not projected in public CDS view
 
-## Project Layout
+## Repository Structure
 
 ```
-agora/
-├── api/
-│   └── src/
-│       ├── routes/         One file per resource group
-│       ├── middleware/      authMiddleware, errorHandler
-│       ├── services/        geocoding, minio, crypto, social/{instagram,facebook}
-│       ├── db/              pool.ts (pg Pool singleton), migrations/, seed.ts
-│       └── index.ts
-├── web/
-│   └── src/
-│       ├── modules/         codex/, forum/, archive/, atlas/, social/
-│       ├── shared/          components/, hooks/, lib/ (API client, types)
-│       └── App.tsx
-├── nginx/nginx.conf
-├── docker-compose.yml
-└── .env.example
+<repo-root>/
+├── REQUIREMENTS.md
+├── DATA_MODEL.md
+├── API_SPEC.md
+├── ARCHITECTURE.md
+├── CLAUDE.md
+└── src/
+    ├── ZAGORA_DATA/        HANA tables, domains, data elements (abapGit XML)
+    └── ZAGORA_SERVICES/    CDS views, behavior definitions, service objects (abapGit XML)
 ```
+
+See `ARCHITECTURE.md` Section 6 for the full object listing.
 
 ## Implementation Status (as of 2026-06-13)
 
-**Design phase — no code written yet.** The `agora/` directory structure does not exist yet.
+**Design phase — no ABAP objects created yet.** The `src/` directory structure does not exist yet.
 
 ### Starting a build session
 
 1. Read all four reference docs in full before touching anything.
-2. Scaffold in this order: `docker-compose.yml` → DB migrations → Express API skeleton → React SPA.
-3. Follow the folder structure in `ARCHITECTURE.md` Section 6 exactly.
+2. Create ABAP objects in this order: HANA tables + domains → CDS interface views → behavior definitions → consumption views → service definitions → service bindings → Fiori apps.
+3. Follow the naming conventions in `ARCHITECTURE.md` Section 4.3 exactly.
 4. Update this section as modules are completed.
 
 ### Completed modules
