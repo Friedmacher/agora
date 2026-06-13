@@ -1,5 +1,5 @@
 {
-  "name": "mf-terraform-base",
+  "name": "agora",
   "image": "mcr.microsoft.com/devcontainers/base:debian",
   "runArgs": ["--network=host"],
   "features": {
