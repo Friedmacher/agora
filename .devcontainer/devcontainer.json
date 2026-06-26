@@ -1,16 +1,26 @@
 {
   "name": "agora",
   "image": "mcr.microsoft.com/devcontainers/base:debian",
+  // --network=host needed so the container can reach SAP BTP ABAP Environment endpoints directly
   "runArgs": ["--network=host"],
   "features": {
-    "ghcr.io/devcontainers/features/node:1": {},
+    // Pin LTS major to avoid unexpected Node upgrades
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "lts"
+    },
     "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
   },
   "customizations": {
     "vscode": {
       "extensions": [
         "anthropic.claude-code"
-      ]
+      ],
+      "settings": {
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true,
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true
+      }
     }
   },
   "remoteUser": "vscode"
