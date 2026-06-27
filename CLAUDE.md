@@ -72,7 +72,7 @@ Pull (Git → ABAP):  In ADT abapGit view, select the ZAGORA repository → Pull
 
 ### Request path
 
-**Admin users**: Browser (Fiori Elements) → OData V4 service binding (`ZAGR_ADMIN_SRV`) → RAP Business Objects (`ZAGR_BP_LOCATION`, `ZAGR_BP_ADMIN_USER`) → SAP HANA.
+**Admin users**: Browser (Fiori Elements) → OData V4 service binding (`ZAGR_ADMIN_SRV`) → RAP Business Objects (`ZAGR_BP_LOCATION`) → SAP HANA.
 
 **Anonymous users**: Browser → React SPA (served by CAP Node.js app) → CAP API endpoints → OData V4 service binding (`ZAGR_PUBLIC_SRV`) → RAP Business Objects → SAP HANA.
 
@@ -95,7 +95,7 @@ All routing is handled by the BTP ABAP Environment's built-in OData gateway — 
 
 ## Domain Entities
 
-`ZAGR_LOCATION`, `ZAGR_VISIT`, `ZAGR_OPENING_HOURS`, `ZAGR_ADMIN_USER` — all `sysuuid_x16` PKs for root/child BOs; `ZAGR_OPENING_HOURS` uses `(LocationId, DayOfWeek)` as key.
+`ZAGR_LOCATION`, `ZAGR_VISIT`, `ZAGR_OPENING_HOURS` — all `sysuuid_x16` PKs for root/child BOs; `ZAGR_OPENING_HOURS` uses `(LocationId, DayOfWeek)` as key.
 
 Key constraints not obvious from field names:
 - `Status`: domain `ZAGR_D_STATUS` — `VISITED | WISHLIST | CLOSED` (default `WISHLIST`)
@@ -129,6 +129,18 @@ Key constraints not obvious from field names:
 ```
 
 See `ARCHITECTURE.md` Section 6 for the full abapGit object listing.
+
+## Diagrams
+
+All diagrams in specification documents must use [Mermaid](https://mermaid.js.org/) fenced code blocks (` ```mermaid `). Choose the diagram type that best fits the content:
+
+- Architecture / component diagrams → `graph TD` or `graph LR`
+- Entity / relationship / BO hierarchy → `graph TD`
+- Sequential flows / pipelines → `graph LR`
+- Directory trees → plain fenced code block (Mermaid has no directory-tree type)
+- Code samples → language-fenced code block (e.g. ` ```javascript `, ` ```abap `)
+
+Do not use ASCII art, Unicode box-drawing characters, or plain-text arrows for diagrams.
 
 ## Implementation Status
 

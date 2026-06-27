@@ -12,59 +12,52 @@ The system implements two distinct access modes:
 
 | Mode | Users | Authentication | Scope | Interface |
 |---|---|---|---|---|
-| **Admin** | Authenticated admin principals | BTP IAS (SAML 2.0 / OIDC) + ABAP authorization object `ZAGR_LOC` | Full CRUD on all entities, Tholos dashboard, User Management | SAP Fiori Elements → `ZAGR_ADMIN_SRV` |
+| **Admin** | Authenticated admin principals | BTP IAS (SAML 2.0 / OIDC) + ABAP authorization object `ZAGR_LOC` | Full CRUD on all entities, Tholos dashboard | SAP Fiori Elements → `ZAGR_ADMIN_SRV` |
 | **Anonymous** | Any unauthenticated user | None | Read-only: Periplus, Pothos, Pinax | SAP CAP Node.js (proxy) → `ZAGR_PUBLIC_SRV` |
 
 The CAP Node.js application is a **pure proxy**: it serves the React SPA and forwards OData read requests to `ZAGR_PUBLIC_SRV` on the ABAP backend. It does not define its own CDS entities or own data layer. All data access — for both modes — is served by the RAP Business Objects on the ABAP system.
 
 ### Component Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Frontend Layer                                │
-│                                                                         │
-│  Admin Users                          Anonymous Users                   │
-│       │                                      │                          │
-│       ▼ HTTPS                                ▼ HTTPS                    │
-│  ┌──────────────────┐                ┌─────────────────────┐            │
-│  │  SAP Fiori       │                │   SAP CAP Node.js   │            │
-│  │  Elements        │                │   + React SPA       │            │
-│  │  (Admin Portal)  │                │  (Public Frontend)  │            │
-│  └──────┬───────────┘                └──────────┬──────────┘            │
-└─────────┼──────────────────────────────────────┼─────────────────────────┘
-          │ OData V4                             │ OData V4
-          │ (authenticated)                      │ (anonymous)
-          ▼                                      ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SAP BTP ABAP Environment                            │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                  OData V4 Service Bindings                      │   │
-│  │   ZAGR_ADMIN_SRV              │        ZAGR_PUBLIC_SRV          │   │
-│  │   (authenticated CRUD)        │        (anonymous read-only)    │   │
-│  └──────────────────┬────────────────────────────┬────────────────┘   │
-│                     │                            │                     │
-│  ┌──────────────────▼────────────────────────────▼────────────────┐   │
-│  │                   RAP Business Objects                          │   │
-│  │    ZAGR_BP_LOCATION (Location + Visit + OpeningHours)           │   │
-│  │    ZAGR_BP_ADMIN_USER                                           │   │
-│  └──────────────────────────────┬──────────────────────────────────┘   │
-│                                 │                                      │
-│  ┌──────────────────────────────▼──────────────────────────────────┐   │
-│  │                    SAP HANA (managed)                           │   │
-│  │    ZAGR_LOCATION · ZAGR_VISIT · ZAGR_OPENING_HOURS              │   │
-│  │    ZAGR_ADMIN_USER                                              │   │
-│  │    ZAGR_LOC_TYPE_T · ZAGR_LOC_TYPE_T_T                         │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Communication Arrangement — Geocoding Service                  │   │
-│  │  (Nominatim / configurable; outbound HTTP from ABAP backend)    │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  BTP Identity Authentication Service (IAS)                             │
-│  ←──── Admin authentication and sessions only                          │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    ADMIN_USR["Admin Users"]
+    ANON_USR["Anonymous Users"]
+
+    subgraph Frontend["Frontend Layer"]
+        FE_ADMIN["SAP Fiori Elements<br/>(Admin Portal)"]
+        FE_ANON["SAP CAP Node.js + React SPA<br/>(Public Frontend)"]
+    end
+
+    subgraph BTP_ABAP["SAP BTP ABAP Environment"]
+        subgraph Services["OData V4 Service Bindings"]
+            ADM_SRV["ZAGR_ADMIN_SRV<br/>(authenticated CRUD)"]
+            PUB_SRV["ZAGR_PUBLIC_SRV<br/>(anonymous read-only)"]
+        end
+
+        subgraph RAP["RAP Business Objects"]
+            BP_LOC["ZAGR_BP_LOCATION<br/>(Location + Visit + OpeningHours)"]
+        end
+
+        subgraph HANA["SAP HANA (managed)"]
+            TABLES["ZAGR_LOCATION · ZAGR_VISIT · ZAGR_OPENING_HOURS<br/>ZAGR_LOC_TYPE_T · ZAGR_LOC_TYPE_T_T"]
+        end
+
+        GEO["Communication Arrangement<br/>(Geocoding — Nominatim / configurable)"]
+        IAS["BTP Identity Authentication Service (IAS)<br/>(admin auth only)"]
+    end
+
+    ADMIN_USR -->|HTTPS| FE_ADMIN
+    ANON_USR -->|HTTPS| FE_ANON
+
+    FE_ADMIN -->|"OData V4 (authenticated)"| ADM_SRV
+    FE_ANON -->|"OData V4 (anonymous)"| PUB_SRV
+
+    ADM_SRV --> BP_LOC
+    PUB_SRV --> BP_LOC
+    BP_LOC --> TABLES
+    BP_LOC -.->|outbound HTTP| GEO
+    FE_ADMIN -.->|"SAML 2.0 / OIDC"| IAS
 ```
 
 ### Service Boundaries
@@ -130,7 +123,7 @@ A PFCG role `ZAGR_ADMIN_ROLE` grants `ZAGR_LOC` with the full activity set (`01`
 
 Authorization checks are performed in the RAP behavior implementation methods before any MODIFY or DELETE operation executes.
 
-Public read access: `ZAGR_PUBLIC_SRV` uses a CDS access control (DCL object) that grants unrestricted read without any authorization object check. Write operations are structurally absent from the public service definition. Anonymous users can read Periplus, Pothos, and Pinax — all exposed via the `Location` entity set on `ZAGR_PUBLIC_SRV`, distinguished by the `Status` field. Tholos and User Management are not exposed on the public service.
+Public read access: `ZAGR_PUBLIC_SRV` uses a CDS access control (DCL object) that grants unrestricted read without any authorization object check. Write operations are structurally absent from the public service definition. Anonymous users can read Periplus, Pothos, and Pinax — all exposed via the `Location` entity set on `ZAGR_PUBLIC_SRV`, distinguished by the `Status` field. Tholos is not exposed on the public service.
 
 ### 3.3 Transport Management
 
@@ -161,7 +154,7 @@ cl_abap_context_info=>get_user_technical_name( )
 ```
 This field is set server-side and must **not** be included in the Create request body — if supplied, it is ignored.
 
-`AdminUserId` is defined on the interface CDS view `ZAGR_I_VISIT`. It is structurally absent from the public consumption view `ZAGR_C_VISIT_PUB`. The admin consumption view `ZAGR_C_VISIT` may expose it, optionally joined with `DisplayName` from `ZAGR_ADMIN_USER` for attribution display.
+`AdminUserId` is defined on the interface CDS view `ZAGR_I_VISIT`. It is structurally absent from the public consumption view `ZAGR_C_VISIT_PUB`.
 
 ### 4.3 Geocoding via Communication Arrangement
 
@@ -209,7 +202,6 @@ All UI behavior is driven by CDS annotations on the consumption CDS views. No cu
 | **Pothos** (wish-list) | Fiori Elements LROP pre-filtered `Status = 'WISHLIST'` | CAP React wish-list page (read-only) | Admin Object Page header: "Promote to Periplus" bound action; "Re-geocode" bound action if coordinates missing |
 | **Pinax** (map) | Embedded map view within admin app | CAP React map page | All non-closed locations with coordinates as colour-coded pins; bold = visited, pastel = wish-list; colour derived from `LocType.BaseColor` |
 | **Tholos** (dashboard) | Fiori Elements Overview Page (OVP) or Analytical List Page (ALP) | **Not accessible** | Admin-only: KPI cards (R-031), sorted location lists (R-032) |
-| Admin User Management | Fiori Elements Simple List Report | **Not accessible** | Create and Delete actions |
 | Location Type Customizing | Fiori Elements Simple List Report | **Not accessible** | Manage `LocType` entries, set `BaseColor` via colour picker |
 
 ### 4.6 Draft Handling
@@ -219,7 +211,6 @@ RAP managed draft is enabled for the `Location` BO (root + all compositions: Vis
 - Declared with `with draft` on the root entity in the behavior definition.
 - Draft HANA tables (`ZAGR_LOC_D`, `ZAGR_VIS_D`, `ZAGR_OPH_D`) are auto-generated by the RAP framework — do not create these manually.
 - Draft is available only on the admin service binding (`ZAGR_ADMIN_SRV`). The public service binding does not expose draft operations.
-- The `AdminUser` BO does not use draft.
 
 ---
 
@@ -248,8 +239,9 @@ The CAP app requires network connectivity to the ABAP system's OData endpoints (
 
 Standard ABAP three-system landscape:
 
-```
-Development system → Quality / Test system → Production system
+```mermaid
+graph LR
+    DEV["Development"] --> QA["Quality / Test"] --> PROD["Production"]
 ```
 
 Transport requests are created and released in ADT (Transport Organizer). Import into quality/production is triggered via the BTP cockpit or the CTS import queue.
@@ -280,7 +272,6 @@ Runtime configuration is managed via:
 │   │   ├── ZAGR_LOCATION.tabl.xml
 │   │   ├── ZAGR_VISIT.tabl.xml
 │   │   ├── ZAGR_OPENING_HOURS.tabl.xml
-│   │   ├── ZAGR_ADMIN_USER.tabl.xml
 │   │   ├── ZAGR_LOC_TYPE_T.tabl.xml
 │   │   ├── ZAGR_LOC_TYPE_T_T.tabl.xml
 │   │   └── ZAGR_D_STATUS.doma.xml
@@ -295,11 +286,9 @@ Runtime configuration is managed via:
 │       ├── ZAGR_C_OPENING_HOURS.ddls.xml
 │       ├── ZAGR_C_OPENING_HOURS_PUB.ddls.xml
 │       ├── ZAGR_C_LOC_TYPE.ddls.xml
-│       ├── ZAGR_C_ADMIN_USER.ddls.xml
 │       ├── ZAGR_C_DASHBOARD_STATS.ddls.xml
 │       ├── ZAGR_I_LOCATION.bdef.xml      (behavior definition)
 │       ├── ZAGR_BP_LOCATION.clas.xml     (behavior impl class)
-│       ├── ZAGR_BP_ADMIN_USER.clas.xml
 │       ├── ZAGR_LOCATION_SD.srvd.xml     (service definition — admin)
 │       ├── ZAGR_LOCATION_PUBLIC_SD.srvd.xml
 │       ├── ZAGR_ADMIN_SRV.srvb.xml       (service binding — admin)

@@ -27,7 +27,6 @@ The application supports exactly two modes of access:
 | **Pothos**     | Wish-List          | Locations the admin plans to visit; promotable to Periplus entries |
 | **Pinax**      | Map                | Geographic map of all places, colour-coded by type and status |
 | **Tholos**     | Dashboard          | Analytics strip + sorted location lists (admin only) |
-| —              | Admin User Mgmt    | Manage recognised admin principals |
 
 ---
 
@@ -103,11 +102,9 @@ Requirement IDs are stable.
 
 ### 2.7 User Management
 
-- **R-040** Two roles: **Admin** (full CRUD, user management) and **Public** (unauthenticated read-only). Role assignment is managed via BTP role collections mapped to IAS user groups.
+- **R-040** Two roles: **Admin** (full CRUD) and **Public** (unauthenticated read-only). Role assignment is managed via BTP role collections mapped to IAS user groups.
 - **R-041** Multiple admin accounts are supported. Admin users are IAS identities assigned to the `Agora_Admin` role collection.
-- **R-042** Admin users are provisioned by an existing admin via the BTP cockpit or IAS admin console. No public self-registration. No seeded superuser script.
-- **R-043** An admin cannot delete their own account. The delete action must return an error if the acting user's IAS principal matches the target user's `IasPrincipal` field.
-- **R-044** Each admin account stores a display name and an IAS principal name (email/username) as the external identity.
+- **R-042** Admin users are provisioned via the BTP cockpit or IAS admin console. No public self-registration. No seeded superuser script.
 
 ### 2.8 Anonymous Read-Only Access
 
@@ -175,8 +172,8 @@ Native iOS/Android apps, image/file storage (no MinIO or DMS), social media inte
 | R-040 | R-040 | Kept |
 | R-041 | R-041 | Kept |
 | R-042 | R-042 | Kept |
-| R-043 | R-043 | Kept |
-| R-044 | R-044 | Kept |
+| R-043 | — | Removed — application relies on ABAP/BTP user management |
+| R-044 | — | Removed — application relies on ABAP/BTP user management |
 | R-050 | R-050 | Kept; renamed Codex → Periplus |
 | R-054 | R-051 | Renamed; Forum → Pothos |
 | — | R-052 | New — anonymous Pinax access |

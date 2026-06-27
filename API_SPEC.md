@@ -37,7 +37,6 @@ The public binding is restricted to read operations via CDS access control (DCL)
 | `Visit` | `ZAGR_C_VISIT` (admin) / `ZAGR_C_VISIT_PUB` (public) | `Location` (nav property `_Visit`) | Both bindings; `AdminUserId` excluded from public |
 | `OpeningHours` | `ZAGR_C_OPENING_HOURS` (admin) / `ZAGR_C_OPENING_HOURS_PUB` (public) | `Location` (nav property `_OpeningHours`) | Both bindings |
 | `LocType` | `ZAGR_C_LOC_TYPE` | — | Admin binding only — read + write for customizing |
-| `AdminUser` | `ZAGR_C_ADMIN_USER` | — | Admin binding only |
 | `DashboardStats` | `ZAGR_C_DASHBOARD_STATS` | — | Admin binding only — exposed as an **unbound OData function** (`GetDashboardStats()`), not as an entity set. No CRUD. |
 
 ---
@@ -99,17 +98,6 @@ Admin-only. Supports the extensible location type list (R-010–R-012).
 | Create | POST | `.../LocType` | Admin | Body: `LocType` (technical key), `BaseColor` (hex), `Description` (display label for logon language) |
 | Update (partial) | PATCH | `.../LocType(LocType='RESTAURANT')` | Admin | Update `BaseColor` or `Description` |
 | Delete | DELETE | `.../LocType(LocType='RESTAURANT')` | Admin | Returns HTTP 422 if any `Location` record references this type |
-
----
-
-## Operations: AdminUser
-
-| Operation | HTTP Method | URL | Auth | Notes |
-|---|---|---|---|---|
-| Read collection | GET | `.../AdminUser` | Admin | No sensitive fields in response |
-| Read entity | GET | `.../AdminUser(UserUuid=guid'...')` | Admin | |
-| Create | POST | `.../AdminUser` | Admin | Creates the application roster record. Separate BTP cockpit step required to assign the `Agora_Admin` role collection to the new user. |
-| Delete | DELETE | `.../AdminUser(UserUuid=guid'...')` | Admin | Returns HTTP 400 if the acting user's IAS principal matches the target record's `IasPrincipal` field (self-delete prevention) |
 
 ---
 
@@ -183,8 +171,6 @@ Exposed as an OData unbound function.
 | `reGeocode` action | Yes | No (405) | No (405) |
 | Read `LocType` | Yes | No | No |
 | Write `LocType` | Yes | No | No |
-| Read `AdminUser` | Yes | No | No |
-| Write `AdminUser` | Yes | No | No |
 | Read `DashboardStats` | Yes | No | No |
 
 ---
