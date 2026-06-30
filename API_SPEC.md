@@ -1,6 +1,6 @@
 # Agora — API Specification
 
-> **Version:** 3.1 | **Status:** AUTHORITATIVE
+> **Version:** 4.0 | **Status:** AUTHORITATIVE
 
 ---
 
@@ -13,6 +13,8 @@ Two types of clients interact with these services:
 - **Anonymous clients**: SAP CAP Node.js application consuming `ZAGR_PUBLIC_SRV` without authentication
 
 All service URLs are accessed via the SAP BTP ABAP Environment's standard OData gateway path pattern.
+
+> **Address fields and BAS:** The `Location` entity exposes `Address`, `ZipCode`, `City`, and `Country` as flat OData properties. These fields are **not** stored as columns in the `ZAGR_LOCATION` HANA table. Instead, they are backed by a SAP Business Address Service (BAS) Business Partner linked via `ZAGR_LOCATION.BpNumber`. The CDS consumption views expose these fields via an association to `I_BusinessPartnerAddress`. Clients see no API surface difference — address fields read and write identically to flat properties. See the [BAS-backed Address Fields](#bas-backed-address-fields) section below for details.
 
 ---
 
@@ -50,10 +52,10 @@ Base path (public): `.../Location`
 |---|---|---|---|---|
 | Read collection | GET | `.../Location` | Public | Supports `$filter`, `$orderby`, `$expand`, `$select`, `$count` |
 | Read entity | GET | `.../Location(LocationUuid=guid'...')` | Public | Supports `$expand=_Visit,_OpeningHours` |
-| Create | POST | `.../Location` | Admin | Body: all non-key, non-RAP-managed fields. ETag returned in response. |
-| Update (partial) | PATCH | `.../Location(LocationUuid=guid'...')` | Admin | ETag required in `If-Match` header. Preferred over PUT for partial updates. |
-| Update (full) | PUT | `.../Location(LocationUuid=guid'...')` | Admin | ETag required in `If-Match` header. |
-| Delete | DELETE | `.../Location(LocationUuid=guid'...')` | Admin | Cascades to `Visit` and `OpeningHours` child entities via RAP managed composition. ETag required. |
+| Create | POST | `.../Location` | Admin | Body: all non-key, non-RAP-managed fields. Address fields (`Address`, `ZipCode`, `City`, `Country`) are accepted in the request body and passed to BAS on draft activation — `BpNumber` is set server-side and must not be supplied. ETag returned in response. |
+| Update (partial) | PATCH | `.../Location(LocationUuid=guid'...')` | Admin | ETag required in `If-Match` header. If any of `Address`, `ZipCode`, `City`, `Country` are included, the behavior implementation updates the BAS address in `AFTER SAVE`. |
+| Update (full) | PUT | `.../Location(LocationUuid=guid'...')` | Admin | ETag required in `If-Match` header. Same BAS address update logic as PATCH. |
+| Delete | DELETE | `.../Location(LocationUuid=guid'...')` | Admin | Cascades to `Visit` and `OpeningHours` child entities via RAP managed composition. ETag required. After HANA deletion, `ZAGR_CL_BAS_HELPER=>delete_bp` is called; BAS deletion failure is non-blocking. |
 | Promote (action) | POST | `.../Location(LocationUuid=guid'...')/com.sap.zagr.promote` | Admin | Bound action; transitions `Status` from `WISHLIST` → `VISITED`. See action spec below. |
 | Re-geocode (action) | POST | `.../Location(LocationUuid=guid'...')/com.sap.zagr.reGeocode` | Admin | Bound action; triggers coordinate resolution from address fields. See action spec below. |
 
@@ -137,7 +139,7 @@ Exposed as an OData unbound function.
 | URL pattern | `.../Location(LocationUuid=guid'...')/com.sap.zagr.reGeocode` |
 | Input parameters | None |
 | Return type | `Location` entity (the updated record, including resolved or cleared coordinates) |
-| Side effects | Calls the geocoding service via Communication Arrangement; on success: writes `Latitude`, `Longitude`, sets `GeoResolved = X`; on failure: clears coordinates, `GeoResolved = space` |
+| Side effects | Calls the geocoding service via Communication Arrangement; address fields for the geocoding call are read from BAS via `I_BusinessPartnerAddress` on `BpNumber` (not from flat `ZAGR_LOCATION` columns). On success: writes `Latitude`, `Longitude`, sets `GeoResolved = X`; on failure: clears coordinates, `GeoResolved = space` |
 | ETag | `If-Match` header required |
 | Error — geocoding failure | HTTP 200 with updated entity returned; geocoding failure is non-blocking. The admin UI displays a warning if coordinates remain unresolved. |
 
@@ -147,7 +149,7 @@ Exposed as an OData unbound function.
 
 | Option | Supported On | Notes |
 |---|---|---|
-| `$filter` | `Location` | Fields: `Status`, `LocType`, `City`, `Country` |
+| `$filter` | `Location` | Fields: `Status`, `LocType`, `City`, `Country`. Note: `City` and `Country` are backed by BAS — filtering on them involves a HANA JOIN on `I_BusinessPartnerAddress`; acceptable at the ~500 location design scale (R-062). |
 | `$orderby` | `Location` | Fields: `Name`, `CreatedAt`, `OverallScore`, `LastChangedAt` |
 | `$expand` | `Location` | Associations: `_Visit`, `_OpeningHours` |
 | `$select` | All entity sets | Standard OData field selection |
@@ -172,6 +174,23 @@ Exposed as an OData unbound function.
 | Read `LocType` | Yes | No | No |
 | Write `LocType` | Yes | No | No |
 | Read `DashboardStats` | Yes | No | No |
+
+---
+
+## BAS-backed Address Fields
+
+The following `Location` entity properties are backed by BAS (`I_BusinessPartnerAddress`) rather than flat HANA columns. From a client perspective these are standard read/write OData properties — the backing store is transparent.
+
+| OData Property | BAS CDS Field (`I_BusinessPartnerAddress`) | Write behaviour |
+|---|---|---|
+| `Address` | `StreetName` | Full street address stored as `StreetName`; `HouseNumber` left empty |
+| `ZipCode` | `PostalCode` | |
+| `City` | `CityName` | Required on Create (minimum: `City` + `Country`) |
+| `Country` | `Country` | `land1` — same ISO 3166-1 alpha-2 domain; F4 value help unchanged |
+
+On **read**, the CDS association in `ZAGR_I_LOCATION` resolves these fields transparently via `I_BusinessPartnerAddress` keyed on `BpNumber` with `AddressUsage = 'XXDEFAULT'`.
+
+On **write** (Create / Update), the RAP behavior implementation intercepts these fields from the `%data` structure and calls `ZAGR_CL_BAS_HELPER` in the `AFTER SAVE` phase to create or update the BAS address. `BpNumber` is set server-side and is not exposed as a writable OData property.
 
 ---
 

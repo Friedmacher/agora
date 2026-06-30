@@ -1,6 +1,6 @@
 # Agora — Requirements
 
-> **Version:** 3.1 | **Status:** AUTHORITATIVE
+> **Version:** 4.0 | **Status:** AUTHORITATIVE
 > **Tagline:** *Find your space. Remember the taste.*
 
 ---
@@ -37,7 +37,7 @@ Requirement IDs are stable.
 ### 2.1 Periplus (Location Log)
 
 - **R-001** Admin can create, read, update, and delete visited locations.
-- **R-002** Each location stores: name, type (from extensible type list — see R-010), address, zip code, city, country (SAP `LAND1` ISO country code), optional website URL, status, coordinates (latitude/longitude — see R-013 and R-014), three dimension ratings, and a computed overall score. Opening hours are managed as a structured child entity (see R-009).
+- **R-002** Each location stores: name, type (from extensible type list — see R-010), address (via BAS — see R-018), optional website URL, status, coordinates (latitude/longitude — see R-013 and R-014), three dimension ratings, and a computed overall score. Opening hours are managed as a structured child entity (see R-009). Address fields (street address, postal code, city, country) are stored in the SAP Business Address Service (BAS) and linked to the location record via a Business Partner reference (`BpNumber`). The `ZAGR_LOCATION` HANA table does not store address fields directly.
 - **R-003** Location type is drawn from an extensible customizing table (see R-010). The default set is: `Restaurant` | `Coffeehouse` | `Bar` | `Bakery`.
 - **R-004** Each location has a visit timeline: one or more Visit records, each with a calendar date (`abap.dats`, date-only — no time component) and an optional text note.
 - **R-005** The date of first visit is derived from the earliest Visit record for that location (not a stored field).
@@ -59,9 +59,11 @@ Requirement IDs are stable.
 
   The UI presents opening hours as a structured inline table on the location detail view with five columns: **Day | Opens | Closes | Opens (2) | Closes (2)**. The fourth and fifth columns are only shown if at least one day in the set has a second opening period populated. A day with `ClosedToday = true` displays a "Closed" marker spanning the time columns instead of time values. Opening hours records are managed within the Location BO as a composition association and are part of the Location draft (admin service only).
 
+- **R-018** **Business Partner lifecycle management:** Every `ZAGR_LOCATION` record is linked to a shadow Business Partner (BP) of type Organization in the SAP Business Address Service (BAS). The BP is created when a Location draft is **first activated** (not during draft save). The BP stores the location's address (street, postal code, city, country) as its default address (usage `XXDEFAULT`). On Location UPDATE, if any address field (`Address`, `ZipCode`, `City`, `Country`) changes, the behavior implementation updates the corresponding BAS address in the `AFTER SAVE` phase. On Location DELETE, the behavior implementation calls BAS to delete the shadow BP; if BAS deletion fails, the error is logged and the Location record is deleted regardless. The `ZAGR_LOCATION.BpNumber` field (type `bu_partner`) stores the 10-digit BP number and is set server-side — it must not be supplied in request bodies.
+
 ### 2.2 Pothos (Wish-List)
 
-- **R-020** Admin can add wish-list entries with a minimum of name + address.
+- **R-020** Admin can add wish-list entries with a minimum of name + address. "Address" here means at minimum a `City` and `Country` — `Street` (`Address` field) and `ZipCode` are optional. Address fields are provided by the admin on Location creation, stored in BAS via the shadow BP (see R-018), and exposed back in the OData entity as flat address properties.
 - **R-021** All other location fields (website, ratings) are optional at creation time for wish-list entries.
 - **R-022** Wish-list entries are displayed with a visually distinct treatment from visited entries across all views. Specifically: in Pinax, wish-list places use a **light/pastel** colour variant of the location-type colour; visited places use a **bold/saturated** colour variant.
 - **R-023** A wish-list entry can be **promoted** to a Periplus entry. Promotion is implemented as a RAP bound action `promote` on the Location BO. The action transitions `Status` from `WISHLIST` to `VISITED`, preserves all existing fields, and returns the updated entity. No new root entity is created.
@@ -95,7 +97,7 @@ Requirement IDs are stable.
 ### 2.6 Geocoding
 
 - **R-013** Every location record holds a latitude and longitude field (`ZAGR_LOCATION.Latitude` / `ZAGR_LOCATION.Longitude`, both `abap.dec(10,7)`). These are the canonical coordinates used by Pinax.
-- **R-014** **Auto-geocoding (preferred path):** When a location is saved (create or update) and coordinates are not already set (or the address has changed), the system attempts to resolve coordinates automatically from the address fields (address, city, country) using a geocoding service call from the ABAP backend. The resolved coordinates are written back to the location record immediately. Geocoding failure is non-blocking: the record is saved without coordinates and a warning state is set (see R-013 / R-029).
+- **R-014** **Auto-geocoding (preferred path):** When a location is saved (create or update) and coordinates are not already set (or the address has changed), the system attempts to resolve coordinates automatically. The geocoding call uses address fields fetched from BAS — `StreetName`, `PostalCode`, `CityName`, `Country` — read via `I_BusinessPartnerAddress` using `BpNumber` as the join key. Geocoding failure is non-blocking: the record is saved without coordinates and a warning state is set (see R-013 / R-029).
 - **R-015** **Manual override:** An admin can manually enter or correct latitude/longitude directly on the location form. A manually set coordinate is not overwritten by subsequent auto-geocoding runs unless the admin explicitly triggers a re-geocode action.
 - **R-016** The geocoding backend is configurable: the default integration target is **Nominatim** (OpenStreetMap). The connection to the geocoding service is configured via a **SAP BTP Communication Arrangement** — a communication system and communication user pair are defined in the BTP ABAP environment, and the RAP behavior class resolves the endpoint and credentials from the communication arrangement at runtime. This allows the geocoding provider to be swapped without code changes.
 - **R-017** A **re-geocode** bound action is available on the Location BO in the admin service, allowing an admin to trigger coordinate resolution on demand for any individual location.
@@ -145,49 +147,50 @@ Native iOS/Android apps, image/file storage (no MinIO or DMS), social media inte
 
 ---
 
-## Appendix: Requirement ID Mapping (v2.0 → v3.1)
+## Appendix: Requirement ID Mapping (v2.0 → v4.0)
 
-| v2.0 ID | v3.1 ID | Disposition |
-|---|---|---|
-| R-001 | R-001 | Kept |
-| R-002 | R-002 | Updated — coordinates, zip code, opening hours added; type references extensible table |
-| R-003 | R-003 | Updated — type list now extensible via customizing |
-| R-004 | R-004 | Kept |
-| R-005 | R-005 | Kept |
-| R-006 | R-006 | Kept |
-| R-007 | R-007 | Kept |
-| R-008 | R-008 | Kept |
-| — | R-009 | New — structured opening hours as child entity |
-| R-020 | R-020 | Kept |
-| R-021 | R-021 | Kept |
-| R-022 | R-022 | Updated — colour variant rule added |
-| R-023 | R-023 | Kept |
-| — | R-024 | New — CLOSED status; visual marking; Pinax exclusion |
-| — | R-025–R-029 | New — Pinax map module |
-| R-030 | R-030 | Kept; renamed to Tholos |
-| R-031 | R-031 | Kept |
-| R-032 | R-032 | Kept |
-| — | R-010–R-012 | New — location type customizing (extensible, translatable, colour picker) |
-| — | R-013–R-017 | New — geocoding (auto + manual override + Communication Arrangement) |
-| R-040 | R-040 | Kept |
-| R-041 | R-041 | Kept |
-| R-042 | R-042 | Kept |
-| R-043 | — | Removed — application relies on ABAP/BTP user management |
-| R-044 | — | Removed — application relies on ABAP/BTP user management |
-| R-050 | R-050 | Kept; renamed Codex → Periplus |
-| R-054 | R-051 | Renamed; Forum → Pothos |
-| — | R-052 | New — anonymous Pinax access |
-| R-051 | R-053 | Kept |
-| R-052 | R-054 | Kept; renamed Archive → Tholos |
-| R-053 | R-055 | Kept |
-| R-060 | R-060 | Kept |
-| R-061 | R-061 | Kept |
-| R-062 | R-062 | Kept |
-| R-063 | R-063 | Kept |
-| R-064 | R-064 | Updated — explicit package `ZAGORA` |
-| R-065 | R-065 | Updated — namespace prefix changed to `ZAGR_` |
-| R-066 | R-066 | Kept; object renamed to `ZAGR_LOC` |
-| R-067 | R-067 | Kept |
-| R-068 | R-068 | Kept; service names updated to `ZAGR_` prefix |
-| R-069 | R-069 | Kept |
-| R-070 | R-070 | Kept; service name updated to `ZAGR_` prefix |
+| v2.0 ID | v3.1 ID | v4.0 ID | Disposition |
+|---|---|---|---|
+| R-001 | R-001 | R-001 | Kept |
+| R-002 | R-002 | R-002 | Updated — address fields moved to BAS (`BpNumber` replaces flat fields in `ZAGR_LOCATION`) |
+| R-003 | R-003 | R-003 | Updated — type list now extensible via customizing |
+| R-004 | R-004 | R-004 | Kept |
+| R-005 | R-005 | R-005 | Kept |
+| R-006 | R-006 | R-006 | Kept |
+| R-007 | R-007 | R-007 | Kept |
+| R-008 | R-008 | R-008 | Kept |
+| — | R-009 | R-009 | New (v3.1) — structured opening hours as child entity |
+| — | — | R-018 | **New (v4.0)** — BP lifecycle management (BAS shadow Business Partner) |
+| R-020 | R-020 | R-020 | Updated — "address" clarified as BAS-backed fields; `City` + `Country` minimum |
+| R-021 | R-021 | R-021 | Kept |
+| R-022 | R-022 | R-022 | Updated — colour variant rule added |
+| R-023 | R-023 | R-023 | Kept |
+| — | R-024 | R-024 | New (v3.1) — CLOSED status; visual marking; Pinax exclusion |
+| — | R-025–R-029 | R-025–R-029 | New (v3.1) — Pinax map module |
+| R-030 | R-030 | R-030 | Kept; renamed to Tholos |
+| R-031 | R-031 | R-031 | Kept |
+| R-032 | R-032 | R-032 | Kept |
+| — | R-010–R-012 | R-010–R-012 | New (v3.1) — location type customizing (extensible, translatable, colour picker) |
+| — | R-013–R-017 | R-013–R-017 | R-014 updated (v4.0) — geocoding now reads address from BAS (`I_BusinessPartnerAddress`) |
+| R-040 | R-040 | R-040 | Kept |
+| R-041 | R-041 | R-041 | Kept |
+| R-042 | R-042 | R-042 | Kept |
+| R-043 | — | — | Removed — application relies on ABAP/BTP user management |
+| R-044 | — | — | Removed — application relies on ABAP/BTP user management |
+| R-050 | R-050 | R-050 | Kept; renamed Codex → Periplus |
+| R-054 | R-051 | R-051 | Renamed; Forum → Pothos |
+| — | R-052 | R-052 | New (v3.1) — anonymous Pinax access |
+| R-051 | R-053 | R-053 | Kept |
+| R-052 | R-054 | R-054 | Kept; renamed Archive → Tholos |
+| R-053 | R-055 | R-055 | Kept |
+| R-060 | R-060 | R-060 | Kept |
+| R-061 | R-061 | R-061 | Kept |
+| R-062 | R-062 | R-062 | Kept |
+| R-063 | R-063 | R-063 | Kept |
+| R-064 | R-064 | R-064 | Updated — explicit package `ZAGORA` |
+| R-065 | R-065 | R-065 | Updated — namespace prefix changed to `ZAGR_` |
+| R-066 | R-066 | R-066 | Kept; object renamed to `ZAGR_LOC` |
+| R-067 | R-067 | R-067 | Kept |
+| R-068 | R-068 | R-068 | Kept; service names updated to `ZAGR_` prefix |
+| R-069 | R-069 | R-069 | Kept |
+| R-070 | R-070 | R-070 | Kept; service name updated to `ZAGR_` prefix |

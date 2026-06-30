@@ -1,6 +1,6 @@
 # Agora — Architecture
 
-> **Version:** 3.1 | **Status:** AUTHORITATIVE
+> **Version:** 4.0 | **Status:** AUTHORITATIVE
 
 ---
 
@@ -43,6 +43,10 @@ graph TD
             TABLES["ZAGR_LOCATION · ZAGR_VISIT · ZAGR_OPENING_HOURS<br/>ZAGR_LOC_TYPE_T · ZAGR_LOC_TYPE_T_T"]
         end
 
+        subgraph BAS_LAYER["SAP Business Address Service (BAS)"]
+            BAS_BP["I_BusinessPartner / I_BusinessPartnerAddress<br/>(Shadow BP of type Organization per Location)"]
+        end
+
         GEO["Communication Arrangement<br/>(Geocoding — Nominatim / configurable)"]
         IAS["BTP Identity Authentication Service (IAS)<br/>(admin auth only)"]
     end
@@ -56,6 +60,7 @@ graph TD
     ADM_SRV --> BP_LOC
     PUB_SRV --> BP_LOC
     BP_LOC --> TABLES
+    BP_LOC -->|"BAS API calls<br/>(create / update / delete BP)"| BAS_BP
     BP_LOC -.->|outbound HTTP| GEO
     FE_ADMIN -.->|"SAML 2.0 / OIDC"| IAS
 ```
@@ -75,33 +80,52 @@ graph TD
 
 **1. Admin creates a location**
 
-Fiori Elements List Report (Create button) → OData POST to `ZAGR_ADMIN_SRV/.../Location` → RAP framework routes to `MODIFY` method of `ZAGR_BP_LOCATION` → behavior implementation validates required fields, checks authorization object `ZAGR_LOC` activity `02` (Create) → inserts row into `ZAGR_LOCATION` → RAP `AFTER SAVE` phase triggers auto-geocoding: behavior implementation resolves HTTP client from Communication Arrangement, calls geocoding service with address fields → on success: `Latitude`, `Longitude`, `GeoResolved = X` written back → OData response `201 Created` with the new entity including `LocationUuid`, `CreatedAt`, `LastChangedAt` (ETag value).
+Fiori Elements List Report (Create button) → OData POST to `ZAGR_ADMIN_SRV/.../Location` → RAP framework routes to `MODIFY` method of `ZAGR_BP_LOCATION` → behavior implementation validates required fields (`City`, `Country` required; `Address`/`ZipCode` optional), checks authorization object `ZAGR_LOC` activity `02` (Create) → address fields (`Address`, `ZipCode`, `City`, `Country`) are buffered in the RAP draft layer (`ZAGR_LOC_D`) during the draft edit phase; the `ZAGR_LOCATION` active table row is NOT inserted until draft activation → admin confirms / activates draft → RAP `AFTER SAVE` phase triggers:
 
-**2. Admin updates ratings (OverallScore recomputation)**
+1. `ZAGR_CL_BAS_HELPER=>create_bp_with_address` is called with the address fields from the draft buffer. BAS creates a Business Partner of type Organization (`BPKind = 2`) with a single default address (usage `XXDEFAULT`). The 10-digit BP number is returned.
+2. `ZAGR_LOCATION.BpNumber` is written with the returned BP number and the active row is committed to HANA.
+3. Auto-geocoding: behavior implementation reads address fields from BAS via `I_BusinessPartnerAddress` on the newly created `BpNumber` (`StreetName`, `PostalCode`, `CityName`, `Country`), resolves the HTTP client from the Communication Arrangement, calls the geocoding service → on success: `Latitude`, `Longitude`, `GeoResolved = X` written back.
+
+OData response `201 Created` with the new entity including `LocationUuid`, `CreatedAt`, `LastChangedAt` (ETag value), and all four address fields resolved via the CDS association to `I_BusinessPartnerAddress`.
+
+**2. Admin updates address fields on a Location**
+
+Fiori Elements Object Page (admin edits `Address`, `City`, `ZipCode`, or `Country`) → OData PATCH on `Location` entity → `If-Match` ETag required → RAP `MODIFY` buffers the address changes in the draft layer → on draft activation, RAP `AFTER SAVE` phase triggers:
+
+1. `ZAGR_CL_BAS_HELPER=>update_bp_address` is called with `BpNumber` from `ZAGR_LOCATION` and the new address field values. BAS updates the default address record (`XXDEFAULT`) for that BP.
+2. Auto-geocoding is re-triggered: behavior implementation reads the updated address from BAS via `I_BusinessPartnerAddress`, calls the geocoding service → coordinates updated.
+
+Returns updated `Location` entity with refreshed address properties via the CDS association.
+
+**3. Admin updates ratings (OverallScore recomputation)**
 
 Fiori Elements Object Page (Save after editing ratings) → OData PATCH on `Location` entity → `If-Match` ETag header required → RAP `MODIFY` method detects that `PriceRating`, `AmbienceRating`, or `QualityRating` is in the changed field set → behavior implementation checks each rating for the initial value (unset) → if all three are set: `OverallScore = (price + ambience + quality) / 3`; if any is unset: `OverallScore = null` → both the changed ratings and the new `OverallScore` are persisted in the same RAP SAVE sequence. No separate or asynchronous step.
 
-**3. Anonymous user browses Periplus, Pothos, or Pinax**
+**4. Admin deletes a Location**
+
+OData DELETE on `Location` entity → `If-Match` ETag required → RAP cascade-deletes child entities (`ZAGR_VISIT`, `ZAGR_OPENING_HOURS`) via managed composition → the `ZAGR_LOCATION` HANA row is deleted → RAP `AFTER SAVE` phase triggers `ZAGR_CL_BAS_HELPER=>delete_bp` with the `BpNumber` that was stored on the Location. If BAS deletion fails (e.g., BP already deleted or referenced elsewhere), the error is written to the application log (`cl_bali_log`) — the Location deletion has already committed and is not rolled back.
+
+**5. Anonymous user browses Periplus, Pothos, or Pinax**
 
 Browser loads the React SPA served by the CAP Node.js application → React app makes API calls to CAP proxy endpoints → CAP proxy translates to OData and forwards to `ZAGR_PUBLIC_SRV` (anonymous binding, no authentication required) → RAP framework evaluates CDS access control (DCL grants unrestricted read) → returns data:
 
-- **Periplus**: `$filter=Status eq 'VISITED'&$orderby=LastChangedAt desc` — visited location list and detail with Visit and OpeningHours child entities
+- **Periplus**: `$filter=Status eq 'VISITED'&$orderby=LastChangedAt desc` — visited location list and detail with Visit and OpeningHours child entities; address fields resolved via BAS CDS association
 - **Pothos**: `$filter=Status eq 'WISHLIST'&$orderby=CreatedAt desc` — wish-list entries
-- **Pinax**: `$filter=Status ne 'CLOSED'&$select=LocationUuid,Name,LocType,Status,Latitude,Longitude,OverallScore` — all non-closed locations with coordinates for map rendering; React SPA further filters out records with null coordinates client-side and calculates pin colours from `LocType.BaseColor` using HSL
+- **Pinax**: `$filter=Status ne 'CLOSED'&$select=LocationUuid,Name,LocType,Status,Latitude,Longitude,OverallScore` — all non-closed locations with coordinates for map rendering; address fields NOT included in this optimised payload (no BAS JOIN incurred); React SPA further filters out records with null coordinates client-side and calculates pin colours from `LocType.BaseColor` using HSL
 
 `Visit` entities are returned from `ZAGR_C_VISIT_PUB` projection, which structurally excludes `AdminUserId`. No write actions are available on the public service.
 
-**4. Wish-list promotion (Pothos → Periplus)**
+**6. Wish-list promotion (Pothos → Periplus)**
 
 Admin triggers the "Promote to Periplus" action on the Location Object Page → Fiori Elements sends OData POST to `.../Location(guid)/com.sap.zagr.promote` → RAP routes to the bound action method in `ZAGR_BP_LOCATION` → action validates `Status = 'WISHLIST'` (raises HTTP 422 if already `VISITED` or `CLOSED`) → sets `Status = 'VISITED'`, updates `LastChangedAt` → returns the updated `Location` entity → Fiori Elements refreshes the Object Page.
 
-**5. Admin views Tholos (dashboard)**
+**7. Admin views Tholos (dashboard)**
 
 Admin navigates to the Tholos Fiori app → app calls `GET .../GetDashboardStats()` on `ZAGR_ADMIN_SRV` → RAP function implementation executes five HANA aggregation queries (COUNT for totals, MAX visit count per location, MAX `OverallScore` excluding nulls) → returns a single structured result → Fiori Elements renders the analytics strip and two sorted location lists.
 
-**6. Admin triggers re-geocode**
+**8. Admin triggers re-geocode**
 
-Admin selects a location missing coordinates and clicks "Re-geocode" → Fiori Elements sends OData POST to `.../Location(guid)/com.sap.zagr.reGeocode` → RAP routes to the bound action in `ZAGR_BP_LOCATION` → behavior implementation calls geocoding service via Communication Arrangement HTTP client → on success: `Latitude`, `Longitude` written, `GeoResolved = X`, warning indicator cleared; on failure: coordinates remain null, warning indicator remains → returns updated `Location` entity.
+Admin selects a location missing coordinates and clicks "Re-geocode" → Fiori Elements sends OData POST to `.../Location(guid)/com.sap.zagr.reGeocode` → RAP routes to the bound action in `ZAGR_BP_LOCATION` → behavior implementation reads address fields from BAS via `I_BusinessPartnerAddress` on `BpNumber` (`StreetName`, `PostalCode`, `CityName`, `Country`), calls the geocoding service via the Communication Arrangement HTTP client → on success: `Latitude`, `Longitude` written, `GeoResolved = X`, warning indicator cleared; on failure: coordinates remain null, warning indicator remains → returns updated `Location` entity.
 
 ---
 
@@ -162,7 +186,7 @@ Coordinate resolution is performed outbound from the ABAP backend using an HTTP 
 
 1. A **Communication System** is defined in the BTP ABAP Environment cockpit, pointing to the geocoding service host (default: `nominatim.openstreetmap.org`).
 2. A **Communication Arrangement** links that system to the `ZAGR_GEOCODING_CA` Communication Scenario.
-3. The behavior implementation instantiates an HTTP client via `cl_http_destination_provider=>get_http_destination( )` using the Communication Arrangement destination, constructs the geocoding request URL from the location's address fields, parses the JSON response, and writes `Latitude`/`Longitude`/`GeoResolved` back to the entity.
+3. The behavior implementation reads address fields from BAS via `I_BusinessPartnerAddress` using `BpNumber` as the key (`StreetName`, `PostalCode`, `CityName`, `Country`), constructs the geocoding request URL from those fields, parses the JSON response, and writes `Latitude`/`Longitude`/`GeoResolved` back to the entity.
 4. Geocoding is triggered in the `AFTER SAVE` phase of the Location BO to ensure it does not block the main transaction.
 5. Failure is non-blocking — the location record is committed without coordinates, and the admin UI surfaces a warning indicator on locations with null coordinates.
 6. Manual coordinate entry by an admin sets `GeoResolved = space` to distinguish from auto-resolved coordinates. The `reGeocode` bound action can re-trigger auto-geocoding on demand.
@@ -190,6 +214,7 @@ All custom development objects use the `ZAGR_` namespace prefix. Sub-packages un
 | ABAP domain | `ZAGR_D_<NAME>` | `ZAGR_D_STATUS` |
 | Communication Scenario | `ZAGR_<NAME>_CA` | `ZAGR_GEOCODING_CA` |
 | RAP draft table (auto-generated) | `ZAGR_<ENTITY>_D` | `ZAGR_LOC_D`, `ZAGR_VIS_D`, `ZAGR_OPH_D` |
+| BAS helper class | `ZAGR_CL_<NAME>` | `ZAGR_CL_BAS_HELPER` |
 
 ### 4.5 Fiori Elements Floorplan Assignments
 
@@ -211,6 +236,48 @@ RAP managed draft is enabled for the `Location` BO (root + all compositions: Vis
 - Declared with `with draft` on the root entity in the behavior definition.
 - Draft HANA tables (`ZAGR_LOC_D`, `ZAGR_VIS_D`, `ZAGR_OPH_D`) are auto-generated by the RAP framework — do not create these manually.
 - Draft is available only on the admin service binding (`ZAGR_ADMIN_SRV`). The public service binding does not expose draft operations.
+- Address fields (`Address`, `ZipCode`, `City`, `Country`) are buffered in the `ZAGR_LOC_D` draft table during the draft phase. The shadow Business Partner is **not** created during draft save — only on first draft activation (see R-018 and section 4.7).
+
+### 4.7 BAS Integration — Business Partner Shadow Entities
+
+Each `ZAGR_LOCATION` record is backed by a shadow Business Partner (BP) in BAS. This section documents the integration pattern.
+
+**BP configuration:** BP kind Organization (`BPKind = 2`); address usage `XXDEFAULT` (SAP standard default address usage). Each shadow BP has exactly one address record.
+
+**New helper class `ZAGR_CL_BAS_HELPER`** — in the `ZAGR_SERVICES` sub-package; all methods are `CLASS-METHODS` (no instance state):
+
+| Method | Signature | Description |
+|---|---|---|
+| `create_bp_with_address` | `IMPORTING iv_street iv_zip iv_city iv_country EXPORTING ev_bp_number` | Creates BP of type Organization and its default address; returns 10-digit BP number |
+| `update_bp_address` | `IMPORTING iv_bp_number iv_street iv_zip iv_city iv_country` | Updates the default address (`XXDEFAULT`) for an existing BP |
+| `delete_bp` | `IMPORTING iv_bp_number` | Deletes the BP; logs errors via `cl_bali_log` but does not propagate if BP not found |
+
+**CDS association in `ZAGR_I_LOCATION`:**
+
+```abap
+association [0..1] to I_BusinessPartnerAddress as _BpAddress
+    on  _BpAddress.BusinessPartner = BpNumber
+    and _BpAddress.AddressUsage    = 'XXDEFAULT'
+
+-- Projected as virtual address fields in the SELECT list:
+_BpAddress.StreetName  as Address,
+_BpAddress.PostalCode  as ZipCode,
+_BpAddress.CityName    as City,
+_BpAddress.Country     as Country,
+```
+
+`BpNumber` is not projected in the consumption views (`ZAGR_C_LOCATION`, `ZAGR_C_LOCATION_PUB`) — it is an internal field (`@Consumption.hidden: true` or simply not included in the SELECT list).
+
+**`AFTER SAVE` sequence for Location activation:**
+
+1. If `BpNumber` is initial (first activation): call `ZAGR_CL_BAS_HELPER=>create_bp_with_address` → write `BpNumber` to `ZAGR_LOCATION`.
+2. If `BpNumber` is populated and address fields changed: call `ZAGR_CL_BAS_HELPER=>update_bp_address`.
+3. Read address from BAS (`I_BusinessPartnerAddress`) using `BpNumber` → call geocoding service.
+4. Write `Latitude` / `Longitude` / `GeoResolved` back.
+
+**Authorization:** BAS API calls run under the process user executing the `AFTER SAVE` phase (the RAP framework's system context). No additional ABAP authorization object check is required for these internal lifecycle calls; they are a side effect of the Location's own authorization-checked CRUD operation.
+
+**`$filter` performance note:** OData `$filter` on `City` or `Country` resolves via a HANA JOIN on `I_BusinessPartnerAddress`. At the design target of ~500 locations (R-062), this JOIN adds negligible overhead. The Pinax optimised payload (`$select=LocationUuid,Name,LocType,Status,Latitude,Longitude,OverallScore`) does not include address fields, so no BAS JOIN is incurred for map pin loading.
 
 ---
 
@@ -292,7 +359,8 @@ Runtime configuration is managed via:
 │       ├── ZAGR_LOCATION_SD.srvd.xml     (service definition — admin)
 │       ├── ZAGR_LOCATION_PUBLIC_SD.srvd.xml
 │       ├── ZAGR_ADMIN_SRV.srvb.xml       (service binding — admin)
-│       └── ZAGR_PUBLIC_SRV.srvb.xml
+│       ├── ZAGR_PUBLIC_SRV.srvb.xml
+│       └── ZAGR_CL_BAS_HELPER.clas.xml   (BAS helper — BP create/update/delete)
 └── cap-frontend/                    SAP CAP Node.js application (anonymous access)
     ├── package.json
     ├── mta.yaml                     MTA deployment descriptor for BTP Cloud Foundry
